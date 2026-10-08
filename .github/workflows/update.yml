@@ -1,0 +1,80 @@
+name: Vigilance feux (FIRMS + IFM 66)
+
+on:
+  workflow_dispatch:
+    inputs:
+      spinup:
+        description: "Refaire la mise en route des codes IFM depuis le 1er mars"
+        type: boolean
+        default: false
+  schedule:
+    # Feux satellites toutes les 20 min ; l'IFM n'est recalculé que s'il a plus de 5 h.
+    - cron: "4,24,44 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vigilance-feux
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v5
+
+      - name: Installer Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installer les dépendances
+        run: python -m pip install --disable-pip-version-check "requests>=2.32,<3" "shapely>=2.0,<3"
+
+      - name: Récupérer la dernière publication
+        run: |
+          git clone -q --depth 1 -b data "https://github.com/${GITHUB_REPOSITORY}.git" pub || mkdir -p pub
+          rm -rf pub/.git
+
+      - name: Feux détectés par satellite (NASA FIRMS)
+        run: |
+          for attempt in 1 2 3; do
+            python scripts/build_feux.py --out pub && break
+            [ "$attempt" -eq 3 ] && { echo "::warning::FIRMS indisponible, publication précédente conservée"; break; }
+            sleep 60
+          done
+
+      - name: Indice forêt météo (IFM) des communes du 66
+        run: |
+          args="--out pub --min-age-hours 5"
+          if [ "${{ inputs.spinup }}" = "true" ]; then args="--out pub --spinup"; fi
+          python scripts/build_fwi.py $args || echo "::warning::IFM non recalculé, publication précédente conservée"
+
+      - name: Vérifier la publication
+        run: |
+          python - <<'PY'
+          import json
+          f = json.load(open("pub/feux.json", encoding="utf-8"))
+          assert f["status"] == "ok" and isinstance(f["foyers"], list)
+          w = json.load(open("pub/fwi-66.json", encoding="utf-8"))
+          assert w["status"] == "ok" and len(w["communes"]) > 200 and len(w["dates"]) >= 10
+          ti = w["dates"].index(w["today"])
+          assert sum(1 for rows in w["data"] if rows[ti]) > 200
+          print("Validation OK :", len(f["foyers"]), "foyers,", len(w["communes"]), "communes IFM")
+          PY
+
+      - name: Publier la branche data
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          touch pub/.nojekyll
+          git init -q -b data pub
+          git -C pub config user.name "github-actions[bot]"
+          git -C pub config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C pub add .
+          git -C pub commit -q -m "Vigilance feux $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git -C pub push -q --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:data
