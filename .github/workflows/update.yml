@@ -33,7 +33,7 @@ jobs:
           cache: pip
 
       - name: Installer les dépendances
-        run: python -m pip install --disable-pip-version-check "requests>=2.32,<3" "shapely>=2.0,<3"
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
 
       - name: Récupérer la dernière publication
         run: |
