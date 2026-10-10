@@ -3,12 +3,12 @@ name: Vigilance feux (FIRMS + IFM 66)
 on:
   workflow_dispatch:
     inputs:
-      spinup:
-        description: "Refaire la mise en route des codes IFM depuis le 1er mars"
+      codes_standard:
+        description: "Mémoire de l'IFM perdue : repartir des codes standard (à réserver aux lendemains de grosse pluie)"
         type: boolean
         default: false
   schedule:
-    # Feux satellites toutes les 20 min ; l'IFM n'est recalculé que s'il a plus de 5 h.
+    # Feux satellites toutes les 20 min ; l'IFM n'est recalculé que s'il a plus de 2 h.
     - cron: "4,24,44 * * * *"
 
 permissions:
@@ -50,8 +50,8 @@ jobs:
 
       - name: Indice forêt météo (IFM) des communes du 66
         run: |
-          args="--out pub --min-age-hours 5"
-          if [ "${{ inputs.spinup }}" = "true" ]; then args="--out pub --spinup"; fi
+          args="--out pub --min-age-hours 2"
+          if [ "${{ inputs.codes_standard }}" = "true" ]; then args="--out pub --codes-standard"; fi
           python scripts/build_fwi.py $args || echo "::warning::IFM non recalculé, publication précédente conservée"
 
       - name: Vérifier la publication
