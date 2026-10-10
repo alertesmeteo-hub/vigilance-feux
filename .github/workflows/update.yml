@@ -51,6 +51,8 @@ jobs:
       - name: Indice forêt météo (IFM) des communes du 66
         run: |
           args="--out pub --min-age-hours 2"
+          # lancement à la main : on recalcule sans attendre
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then args="--out pub"; fi
           if [ "${{ inputs.codes_standard }}" = "true" ]; then args="--out pub --codes-standard"; fi
           python scripts/build_fwi.py $args || echo "::warning::IFM non recalculé, publication précédente conservée"
 
