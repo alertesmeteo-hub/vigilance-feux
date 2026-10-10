@@ -12,7 +12,9 @@ Les modèles ne donnent que le présent et l'avenir ; le passé est donc conserv
  - les jours passés sont repris tels quels de la publication précédente (fwi-66.json) ;
  - la pluie est archivée heure par heure dans state-66.json (« pluie »), à la manière des « premières heures de chaque
    prévision » : à chaque calcul, les heures à partir du début du meilleur modèle sont remplacées par sa prévision ; les
-   heures plus anciennes gardent la valeur archivée. La pluie de 24 h du jour en cours s'appuie sur cette archive.
+   heures plus anciennes gardent la valeur archivée. La pluie de 24 h du jour en cours s'appuie sur cette archive ;
+ - le fichier AROME est parfois tronqué juste après un nouveau run : un jour à venir garde alors, pendant 18 h au plus, les entrées
+   calculées avec un meilleur modèle lors d'un calcul précédent (« memoire » dans state-66.json), au lieu de repasser sur ARPEGE.
 Publie fwi-66.json : 7 jours passés (tendance) + aujourd'hui + 6 jours de prévision.
 """
 from __future__ import annotations
@@ -23,6 +25,7 @@ import sys
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import fwi
 import modeles
@@ -33,6 +36,7 @@ PAST_DAYS = 8  # 7 jours affichés + la veille
 FORECAST_DAYS = 7
 KEEP_STATE_DAYS = 21
 HEURES_MANQUANTES_MAX = 6  # au-delà, sans valeur de repli, la pluie du jour est inconnue : pas de ligne
+MEMOIRE_MAX_H = 18  # âge maximal (depuis l'initialisation du run) des entrées gardées en mémoire pour un jour à venir
 
 # Classes de danger (seuils EFFIS / Copernicus pour l'Europe du Sud)
 CLASSES = [
@@ -44,10 +48,23 @@ CLASSES = [
     (50.0, 6, "Extrême"),
 ]
 
+NOMS = [nom for nom, _ in modeles.SOURCES]  # indexé par le rang du modèle
+
 # Colonnes d'une ligne publiée
 FWI, ISI, BUI, FFMC, DMC, DC, T, RH, WS, WD, GUST, RR = range(12)
 
-Series = list[tuple[str, dict[int, Heure]]]  # séries horaires d'une commune par modèle, par priorité décroissante
+
+
+class SerieModele(NamedTuple):
+    """Série horaire d'une commune d'après un modèle."""
+
+    nom: str
+    rang: int  # 0 = AROME, 1 = ARPEGE, 2 = ICON
+    init: int  # heure UTC (depuis l'epoch) d'initialisation du run
+    heures: dict[int, Heure]
+
+
+Series = list[SerieModele]  # par priorité décroissante
 
 
 def classe(v: float) -> int:
@@ -76,7 +93,7 @@ def mettre_a_jour_archive(archive: dict[int, float], series: Series) -> None:
     À partir du début du meilleur modèle chargé, chaque heure prend la valeur du meilleur modèle qui la couvre ; avant, les
     valeurs déjà archivées sont conservées et seules les heures absentes sont comblées par un modèle moins fin.
     """
-    pluies = [{h: x.rr for h, x in s.items() if x.rr is not None} for _, s in series]
+    pluies = [{h: x.rr for h, x in s.heures.items() if x.rr is not None} for s in series]
     pluies = [p for p in pluies if p]
     if not pluies:
         return
@@ -98,7 +115,8 @@ def pluie_fenetre(jour: date, series: Series, archive: dict[int, float]) -> tupl
     """
     h12 = heure_utc(jour, 12)
     fenetre = range(h12 - 23, h12 + 1)
-    for _, s in series:
+    for m in series:
+        s = m.heures
         if all(h in s and s[h].rr is not None for h in fenetre):
             return sum(s[h].rr for h in fenetre), 0  # type: ignore[misc]
     total, manque = 0.0, 0
@@ -154,11 +172,12 @@ def entrees_jour(jour: date, series: Series, archive: dict[int, float], preceden
     h12 = heure_utc(jour, 12)
     midi: Heure | None = None
     source = ""
+    rang = init = None
     serie_midi: dict[int, Heure] = {}
-    for nom, s in series:
-        x = s.get(h12)
+    for m in series:
+        x = m.heures.get(h12)
         if x and x.t is not None and x.rh is not None and x.ws is not None:
-            midi, source, serie_midi = x, nom, s
+            midi, source, rang, init, serie_midi = x, m.nom, m.rang, m.init, m.heures
             break
     gust_prec = precedente[GUST] if precedente and jour_en_cours else None
     if midi is None:
@@ -176,7 +195,34 @@ def entrees_jour(jour: date, series: Series, archive: dict[int, float], preceden
     rafales = [x.gust for h, x in serie_midi.items() if h12 - 12 <= h < h12 + 12 and x.gust is not None]
     if gust_prec is not None:
         rafales.append(gust_prec)
-    return {"t": midi.t, "rh": min(100.0, max(0.0, midi.rh)), "ws": max(0.0, midi.ws), "wd": midi.wd, "gust": max(rafales) if rafales else None, "rr": rr, "source": source, "manque": manque}
+    return {"t": midi.t, "rh": min(100.0, max(0.0, midi.rh)), "ws": max(0.0, midi.ws), "wd": midi.wd, "gust": max(rafales) if rafales else None, "rr": rr, "source": source, "rang": rang, "init": init, "manque": manque}
+
+
+def choisir_memoire(x: dict | None, m: list | None, maintenant_h: int, jour_en_cours: bool) -> tuple[dict | None, list | None]:
+    """Entrées d'un jour d'après le calcul frais `x` et la mémoire `m` = [rang, init, t, rh, ws, wd, gust, rr] du même jour.
+
+    La mémoire l'emporte quand elle vient d'un modèle plus fin que le calcul frais (ou que celui-ci n'existe pas) et que son run a
+    moins de MEMOIRE_MAX_H heures ; le jour en cours garde néanmoins la pluie fraîche, tirée de l'archive. À modèle égal, le calcul
+    frais remplace la mémoire. Retourne (entrées retenues, mémoire à conserver).
+    """
+    if m is not None and maintenant_h - m[1] <= MEMOIRE_MAX_H and (x is None or x["rang"] is None or m[0] < x["rang"]):
+        y = {"t": m[2], "rh": m[3], "ws": m[4], "wd": m[5], "gust": m[6], "rr": m[7], "source": f"{NOMS[m[0]]} (mémoire)", "rang": m[0], "init": m[1], "manque": 0}
+        if jour_en_cours and x is not None:
+            y["rr"] = x["rr"]
+        return y, m
+    if x is not None and x["rang"] is not None:
+        r = lambda v, d: None if v is None else round(v, d)  # noqa: E731
+        return x, [x["rang"], x["init"], r(x["t"], 2), r(x["rh"], 1), r(x["ws"], 1), r(x["wd"], 0), r(x["gust"], 1), r(x["rr"], 2)]
+    return x, None
+
+
+def lire_memoire(doc: dict | None, today: date) -> dict[str, dict[str, list]]:
+    out: dict[str, dict[str, list]] = {}
+    if isinstance(doc, dict):
+        for code, jours in doc.items():
+            if isinstance(jours, dict):
+                out[code] = {d: v for d, v in jours.items() if d >= today.isoformat() and isinstance(v, list) and len(v) == 8}
+    return out
 
 
 def ligne(r: dict, x: dict) -> list:
@@ -236,6 +282,9 @@ def main(argv: list[str] | None = None, maintenant: datetime | None = None) -> i
     state = lire_json(out / "state-66.json") or {}
     hist: dict[str, dict[str, list[float]]] = state.get("history", {})
     archives = lire_archive(state.get("pluie"))
+    memoire = lire_memoire(state.get("memoire"), today)
+    nouvelle_memoire: dict[str, dict[str, list]] = {}
+    maintenant_h = int(maintenant.timestamp() // 3600)
 
     mods = modeles.charger_modeles(args.modeles_dir)
     if not mods:
@@ -253,7 +302,7 @@ def main(argv: list[str] | None = None, maintenant: datetime | None = None) -> i
         for m in mods:
             k = modeles.choisir_point(m, lat, lon, alt)
             if k is not None:
-                series.append((m.nom, modeles.serie_commune(m, k, alt)))
+                series.append(SerieModele(m.nom, m.rang, m.init, modeles.serie_commune(m, k, alt)))
         archive = archives.setdefault(code, {})
         mettre_a_jour_archive(archive, series)
         garder_archive(archive, today)
@@ -268,6 +317,7 @@ def main(argv: list[str] | None = None, maintenant: datetime | None = None) -> i
         if codes is None:
             sans_codes.append(code)
         rows: list[list | None] = []
+        mem_commune: dict[str, list] = {}
         for ds in dates_shown:
             jour = date.fromisoformat(ds)
             prec = precedent.get(code, {}).get(ds)
@@ -278,6 +328,9 @@ def main(argv: list[str] | None = None, maintenant: datetime | None = None) -> i
                 rows.append(None)
                 continue
             x = entrees_jour(jour, series, archive, prec, jour_en_cours=(jour == today), tolere_manque=args.codes_standard)
+            x, garde = choisir_memoire(x, memoire.get(code, {}).get(ds), maintenant_h, jour == today)
+            if garde:
+                mem_commune[ds] = garde
             if x is None:
                 rows.append(None)
                 continue
@@ -288,6 +341,7 @@ def main(argv: list[str] | None = None, maintenant: datetime | None = None) -> i
             if jour == today:  # fin de journée provisoire : le calcul de demain repart d'ici
                 new_hist.setdefault(ds, {})[code] = [round(r["ffmc"], 3), round(r["dmc"], 3), round(r["dc"], 3)]
         per_commune.append(rows)
+        nouvelle_memoire[code] = mem_commune
 
     if sans_codes:
         print(f"Attention : pas de codes de départ pour {len(sans_codes)} communes ({', '.join(sans_codes[:5])}…) — lignes vides.")
@@ -330,7 +384,7 @@ def main(argv: list[str] | None = None, maintenant: datetime | None = None) -> i
     }
     (out / "fwi-66.json").write_text(json.dumps(doc, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     (out / "state-66.json").write_text(
-        json.dumps({"updated_at": now, "history": dict(sorted(new_hist.items())), "pluie": ecrire_archive(archives)}, separators=(",", ":")),
+        json.dumps({"updated_at": now, "history": dict(sorted(new_hist.items())), "pluie": ecrire_archive(archives), "memoire": nouvelle_memoire}, separators=(",", ":")),
         encoding="utf-8",
     )
     print(f"IFM 66 publié — maxi aujourd'hui : {worst[0][1]} {worst[1][FWI]} ({len(communes)} communes, {len(dates_shown)} jours)")

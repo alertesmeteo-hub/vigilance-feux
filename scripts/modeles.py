@@ -48,6 +48,12 @@ class Modele:
     points: list[tuple[float, float, float]]  # latitude, longitude, altitude du modèle (m)
     colonnes: dict[str, int]
     lignes: list[list[list]]  # lignes[pas][point][colonne]
+    rang: int = 0  # 0 = le plus fin (AROME), plus grand = moins fin
+
+    @property
+    def init(self) -> int:
+        """Heure UTC (depuis l'epoch) du premier pas, c'est-à-dire de l'initialisation du run."""
+        return self.heures[0]
 
 
 def _fini(v: object) -> bool:
@@ -163,7 +169,7 @@ def _telecharger(url: str, tentatives: int = 3) -> dict | None:
 def charger_modeles(dossier: str | None = None, departement: str = "66") -> list[Modele]:
     """Les modèles disponibles, par priorité décroissante. `dossier` : lecture locale (<dossier>/<dépôt>.json) pour les tests."""
     out: list[Modele] = []
-    for nom, depot in SOURCES:
+    for rang, (nom, depot) in enumerate(SOURCES):
         if dossier:
             f = Path(dossier) / f"{depot}.json"
             doc = json.loads(f.read_text(encoding="utf-8")) if f.exists() else None
@@ -171,6 +177,7 @@ def charger_modeles(dossier: str | None = None, departement: str = "66") -> list
             doc = _telecharger(f"{RAW}{depot}/data/departements/{departement}.json")
         m = lire_modele(nom, doc) if isinstance(doc, dict) else None
         if m:
+            m.rang = rang
             print(f"Modèle {nom} : {len(m.points)} points, {len(m.heures)} pas, généré {m.genere}", flush=True)
             out.append(m)
         else:
